@@ -14,7 +14,9 @@ Developers declare REST endpoints on controllers with rich, type-checked metadat
 - **Service** layer methods with lookup, projection, and association loading
 - Optional **mapping** glue between entities and response DTOs
 
-The controller method body remains a thin declaration (or empty stub); behavior is synthesized before the application runs. Incorrect `lookupBy`, missing entities, or invalid association paths fail at **compile time**, not in production.
+**Hand-written** (author-owned): JPA entities, response DTOs (one per shape/graph), and controller shells with annotated method signatures. **Generated**: repository, service, mappers, and fetch/query variants tied to each declared bind key and trail set.
+
+The controller method body remains a thin declaration (or empty stub); behavior is synthesized before the application runs. Incorrect `lookupBy`, missing entities, invalid association paths, or a **trail/DTO mismatch** fail at **compile time**, not in production.
 
 **Codename:** **TypeWeave** — weaving controller contracts into persistence and service layers.
 
@@ -28,9 +30,11 @@ The controller method body remains a thin declaration (or empty stub); behavior 
 |----|------|
 | G1 | Type-safe entity and field references in annotations (no stringly-typed JPQL in controllers) |
 | G2 | Compile-time generation of repository + service methods per endpoint |
-| G3 | First-class support for primary lookup and eager/lazy association hints (`alsoGet`) |
-| G4 | Spring Boot 4 idioms: constructor injection, `@Transactional` on services, optional virtual threads |
-| G5 | Clear, actionable compiler errors (mirror validation-annotation style from prior art in this repo) |
+| G3 | First-class support for primary lookup and association hints (`alsoGet` / `@Trail`) |
+| G4 | **Pagination** on list/read-collection endpoints (page, size, sort) |
+| G5 | **Trail-driven response DTOs** — base GET vs `?trail=…` selects different hand-written DTO types at compile time |
+| G6 | Spring Boot 4 idioms: constructor injection, `@Transactional` on services, optional virtual threads |
+| G7 | Clear, actionable compiler errors (mirror validation-annotation style from prior art in this repo) |
 
 ### Non-Goals (v1)
 
@@ -38,6 +42,7 @@ The controller method body remains a thin declaration (or empty stub); behavior 
 - Full GraphQL or arbitrary query DSL
 - Multi-datasource routing (deferred)
 - Generating OpenAPI from annotations (optional later via springdoc)
+- A single “god” response DTO that silently changes shape at runtime based on trail (explicit DTO per trail shape instead)
 
 ---
 
@@ -102,7 +107,7 @@ flowchart TB
 
 ```
 typesafe-api/
-├── typeweave-annotations/     # @WeaveRead, @BindKey, @Trail, meta-annotations
+├── typeweave-annotations/     # @WeaveRead, @WeaveList, @TrailShape, @BindKey, …
 ├── typeweave-processor/       # APT + code templates (JavaPoet or StringTemplate)
 ├── typeweave-runtime/         # Small runtime helpers (e.g. FieldRef resolution)
 ├── app/                       # Spring Boot 4 application (demo + integration tests)
@@ -120,15 +125,53 @@ Annotations use **type-safe field references** via a small `FieldRef<E, V>` (or 
 | Annotation | Target | Purpose |
 |------------|--------|---------|
 | `@WeaveController` | Type | Marks a REST controller participating in TypeWeave |
-| `@WeaveRead` | Method | Declares a type-safe GET (or read) endpoint contract |
+| `@WeaveRead` | Method | Declares a type-safe GET (single resource) contract |
+| `@WeaveList` | Method | Declares a paginated collection GET |
 | `@WeaveWrite` | Method | Declares POST/PUT/PATCH/DELETE (phase 2) |
-| `@BindKey` | `@WeaveRead` member | Primary lookup field on the entity |
-| `@Trail` | `@WeaveRead` member | Association path(s) to load with the root entity |
-| `@ResponseShape` | `@WeaveRead` member | DTO class or projection interface |
+| `@BindKey` | `@WeaveRead` / `@WeaveList` member | Primary lookup field on the entity |
+| `@Trail` | Member or repeatable | Association path(s) to load; may be request-driven via query param |
+| `@ResponseShape` | `@Trail` or method | DTO class valid for a given trail set (see §5.4) |
+| `@DefaultResponse` | `@WeaveRead` member | DTO when no trail (or empty trail) is requested |
 
-### 5.2 Example (evolved from thoughts.md)
+### 5.2 Hand-written vs generated
+
+From [thoughts.md](./thoughts.md): entities, DTOs, and controllers are **hand-written**; TypeWeave generates everything below the controller signature.
+
+| Hand-written | Generated |
+|--------------|-----------|
+| `UserEntity`, `OrderEntity`, … | `{Entity}Repository` (+ fetch variants per trail set) |
+| `UserResponseDto`, `UserDetailResponseDto`, … | `{Entity}Service`, `{Entity}ServiceImpl` |
+| `UserController` method signatures + annotations | Entity→DTO mappers (MapStruct or TypeWeave stub) |
+
+### 5.3 Example (evolved from thoughts.md)
+
+Original sketch:
 
 ```java
+// hand-written
+class UserEntity { }
+class UserDetailResponseDto { }
+
+class UserController {
+    @ApiGetMetadata(
+        entity = UserEntity.class,
+        lookupBy = UserEntity.id,
+        alsoGet = { user.order }
+    )
+    public UserDetailResponseDto getUser(...);
+}
+```
+
+TypeWeave equivalent — **two response shapes** on the same resource (see §5.4):
+
+```java
+// hand-written
+@Entity
+class UserEntity { /* … */ }
+
+class UserResponseDto { /* scalar fields only */ }
+class UserDetailResponseDto { /* includes order graph */ }
+
 @WeaveController
 @RestController
 @RequestMapping("/api/users")
@@ -140,26 +183,97 @@ public class UserController {
         this.userService = userService;
     }
 
+    // GET /api/users/{id}  →  UserResponseDto
     @WeaveRead(
         entity = UserEntity.class,
-        bindKey = @BindKey(UserEntity_.id),           // static metamodel or FieldRef
-        trail = { @Trail(UserEntity_.orders) },
-        response = UserDetailResponseDto.class
+        bindKey = @BindKey(UserEntity_.id),
+        defaultResponse = UserResponseDto.class
     )
     @GetMapping("/{id}")
-    public UserDetailResponseDto getUser(@PathVariable Long id) {
-        return userService.getUserById(id);           // generated on UserService
+    public UserResponseDto getUser(
+            @PathVariable Long id,
+            @RequestParam(required = false) String trail) {
+        return userService.getUser(id, trail);   // generated overload dispatches by trail
     }
+
+    // Optional: compile-time registry ties trail "user.orders" → UserDetailResponseDto
+    // (processor validates; see @TrailShape below)
 }
 ```
+
+Declarative trail → DTO registry on the same endpoint (preferred for compile-time checks):
+
+```java
+@WeaveRead(
+    entity = UserEntity.class,
+    bindKey = @BindKey(UserEntity_.id),
+    defaultResponse = UserResponseDto.class,
+    shapes = {
+        @TrailShape(trail = @Trail(UserEntity_.orders), response = UserDetailResponseDto.class)
+    }
+)
+@GetMapping("/{id}")
+public Object getUser(@PathVariable Long id, @RequestParam(required = false) String trail) {
+    return userService.getUser(id, trail);
+}
+```
+
+The processor emits **one service method** that branches on normalized `trail` and returns the type declared for that shape; return type on the controller may be a common supertype or generic wrapper only if all shapes share one (otherwise use separate mapped methods — see §5.4).
 
 **Naming rationale**
 
 - **Weave** — compile-time weaving of layers
-- **BindKey** — which column/property binds the HTTP input to the entity
+- **BindKey** — which column/property binds the HTTP input to the entity (`lookupBy`)
 - **Trail** — follow a path through the object graph (replaces `alsoGet`)
+- **TrailShape** — binds a trail expression to exactly one response DTO
 
-### 5.3 Type-safe field references
+### 5.4 Trail-driven response DTOs (gotcha)
+
+[thoughts.md](./thoughts.md) requires **separate type-safe response DTOs** per graph shape — not one DTO whose fields appear or disappear at runtime.
+
+| Request | Loaded graph | Response DTO (hand-written) |
+|---------|--------------|----------------------------|
+| `GET /users/{id}` | Root entity only | `UserResponseDto` |
+| `GET /users/{id}?trail=user.orders` | User + orders (`@OneToMany`) | `UserDetailResponseDto` |
+| `GET /users/{id}?trail=user.profile` | User + profile (`@ManyToOne`) | e.g. `UserWithProfileResponseDto` |
+
+Rules:
+
+1. **`defaultResponse`** — used when `trail` is absent or empty; must not require associations beyond what the DTO declares.
+2. **`@TrailShape`** — each entry lists a canonical trail (metamodel path) and exactly one `response` DTO. The processor verifies every DTO field is satisfiable from entity + that trail’s graph.
+3. **Cardinality** — applies equally to `@OneToMany` and `@ManyToOne` (and `@OneToOne`): expanding the graph requires a **different** hand-written DTO type, registered via `@TrailShape`.
+4. **Compile-time** — unknown trail string → runtime 400 (validated against allowed set from `shapes`); trail that maps to shape A but controller return type only mentions shape B → **TW007** at compile time.
+5. **Repository/service** — processor generates `findById` (no trail) and `findByIdWithOrders` (etc.) per distinct trail shape; service delegates based on normalized trail.
+
+Query parameter format (v1): `trail=user.orders` (dot-separated, matching metamodel path); alias map configurable in `typeweave.trail-aliases`.
+
+### 5.5 Pagination
+
+List endpoints use `@WeaveList` with the same entity/bind/trail/DTO rules as `@WeaveRead`, plus page metadata.
+
+```java
+@WeaveList(
+    entity = UserEntity.class,
+    defaultResponse = UserSummaryResponseDto.class,
+    shapes = {
+        @TrailShape(trail = @Trail(UserEntity_.orders), response = UserSummaryWithOrdersDto.class)
+    },
+    pageable = true,
+    defaultPageSize = 20,
+    maxPageSize = 100,
+    sortable = { "id", "createdAt" }
+)
+@GetMapping
+public Page<UserSummaryResponseDto> listUsers(
+        @RequestParam(required = false) String trail,
+        @ParameterObject Pageable pageable) {
+    return userService.listUsers(trail, pageable);
+}
+```
+
+Generated repository methods use `Pageable` / `Page<T>` (Spring Data). Trail shapes on lists apply fetch joins or batch fetching per global `typeweave.fetch-many` policy. Invalid sort fields → compile-time **TW008** when `sortable` is explicit.
+
+### 5.6 Type-safe field references
 
 Two supported mechanisms (pick one for v1, document the other as v1.1):
 
@@ -176,7 +290,7 @@ The processor resolves `BindKey` and `Trail` to:
 
 ## 6. Generated Artifacts
 
-For each `@WeaveRead` method, the processor emits artifacts in `target/generated-sources/typeweave/` (package mirrors entity module).
+For each `@WeaveRead` / `@WeaveList` method, the processor emits artifacts in `target/generated-sources/typeweave/` (package mirrors entity module).
 
 ### 6.1 Repository
 
@@ -196,7 +310,7 @@ Naming convention: `{Entity}Repository`, method `{action}{TrailHint}By{BindKeyPr
 ```java
 // Generated: com.example.user.UserService + UserServiceImpl
 public interface UserService {
-    UserDetailResponseDto getUserById(Long id);
+    Object getUser(Long id, String trail);   // dispatches to shape-specific logic
 }
 
 @Service
@@ -204,21 +318,31 @@ public interface UserService {
 public class UserServiceImpl implements UserService {
 
     private final UserRepository userRepository;
-    private final UserDetailMapper userDetailMapper; // MapStruct or generated mapper
+    private final UserResponseMapper userResponseMapper;
+    private final UserDetailResponseMapper userDetailResponseMapper;
 
     @Override
-    public UserDetailResponseDto getUserById(Long id) {
-        UserEntity entity = userRepository.findWithOrdersById(id)
-            .orElseThrow(() -> new ResourceNotFoundException("User", id));
-        return userDetailMapper.toDetail(entity);
+    public Object getUser(Long id, String trail) {
+        if (trail == null || trail.isBlank()) {
+            return userRepository.findById(id)
+                .map(userResponseMapper::toDto)
+                .orElseThrow(() -> new ResourceNotFoundException("User", id));
+        }
+        if ("user.orders".equals(normalize(trail))) {
+            return userRepository.findWithOrdersById(id)
+                .map(userDetailResponseMapper::toDto)
+                .orElseThrow(() -> new ResourceNotFoundException("User", id));
+        }
+        throw new InvalidTrailException(trail, Set.of("user.orders"));
     }
 }
 ```
 
 ### 6.3 Mapper (optional v1)
 
-- If `response` DTO is specified, generate or trigger MapStruct `@Mapper` for entity → DTO
-- Map only fields present on DTO; trails define which associations are available on the entity graph
+- One MapStruct (or generated) mapper per **trail shape**: `UserResponseMapper`, `UserDetailResponseMapper`, etc.
+- Map only fields present on each hand-written DTO; processor error if DTO references an association not on the declared trail
+- Shared scalar mapping may delegate to a base mapper fragment
 
 ### 6.4 Controller wiring
 
@@ -226,7 +350,9 @@ The hand-written controller **must** call the generated service method signature
 
 - Method name alignment (configurable strict vs convention-based)
 - Parameter types (`Long id` matches `@BindKey` type)
-- Return type matches `@ResponseShape`
+- `defaultResponse` and each `@TrailShape.response` are distinct hand-written types
+- Return type is assignable from the DTO for the implied call (or documented supertype when using trail dispatch)
+- List methods use `Page<DTO>` consistent with the shape selected for an empty trail
 
 Mismatch → **compiler error** with element and fix suggestion.
 
@@ -237,12 +363,14 @@ Mismatch → **compiler error** with element and fix suggestion.
 ### 7.1 Processing rounds
 
 1. **Collect** all types annotated with `@WeaveController`
-2. For each method with `@WeaveRead` / `@WeaveWrite`:
+2. For each method with `@WeaveRead` / `@WeaveList` / `@WeaveWrite`:
    - Validate entity class is a JPA `@Entity`
    - Resolve `BindKey` to a persistent attribute
-   - Resolve each `Trail` segment (association must exist, no cycles in v1)
-   - Validate response DTO is assignable from a mapping of entity + trails
-3. **Emit** repository interface, service interface + impl, mapper stub
+   - Resolve each `Trail` / `@TrailShape` (association must exist, no cycles in v1)
+   - Build trail registry: empty trail → `defaultResponse`; each shape → its DTO
+   - Validate each DTO only references fields available on its trail graph (incl. `@OneToMany`, `@ManyToOne`)
+   - For `@WeaveList`, validate pagination/sort metadata
+3. **Emit** repository interface (+ `Page` variants for lists), service interface + impl, mapper stubs per shape
 4. **Register** Spring components via `@Generated` + standard stereotypes (processor adds `@Repository` / `@Service` on impl)
 
 ### 7.2 Incremental compilation
@@ -258,9 +386,12 @@ Mismatch → **compiler error** with element and fix suggestion.
 | TW001 | `entity` is not a JPA entity |
 | TW002 | `BindKey` field not found on entity |
 | TW003 | `Trail` path invalid or not an association |
-| TW004 | Controller return type does not match `response` |
+| TW004 | Controller return type does not match `defaultResponse` or `@TrailShape.response` |
 | TW005 | Duplicate generated method name for same bind + trails |
 | TW006 | Service method invoked from controller does not exist on generated interface |
+| TW007 | Trail shape `response` DTO incompatible with entity graph or controller return type |
+| TW008 | `@WeaveList` sort field not in `sortable` or invalid pagination config |
+| TW009 | Duplicate `@TrailShape` for the same normalized trail on one method |
 
 ---
 
@@ -280,11 +411,18 @@ Mismatch → **compiler error** with element and fix suggestion.
 
 Configuration bean `TypeWeaveProperties` (`typeweave.fetch-many=entity-graph|join|batch`).
 
-### 8.3 Exception mapping
+### 8.3 Trail query handling (runtime)
+
+1. Parse `trail` query param (if present); normalize to canonical path.
+2. Match against allowed shapes from `@TrailShape`; if no match → `400 Bad Request` with allowed trails in problem detail.
+3. Select repository fetch variant + mapper for that shape; if absent → `defaultResponse` path (minimal fetch).
+
+### 8.4 Exception mapping
 
 - `ResourceNotFoundException` → HTTP 404 via `@ControllerAdvice` in `typeweave-runtime` (optional starter)
+- `InvalidTrailException` → HTTP 400
 
-### 8.4 Virtual threads (Java 25 + Boot 4)
+### 8.5 Virtual threads (Java 25 + Boot 4)
 
 ```yaml
 spring.threads.virtual.enabled: true
@@ -305,7 +443,8 @@ com.example.app
 ├── api
 │   ├── UserController.java       @WeaveController + @WeaveRead
 │   └── dto
-│       └── UserDetailResponseDto.java
+│       ├── UserResponseDto.java          # default shape
+│       └── UserDetailResponseDto.java    # trail=user.orders
 └── config
     └── TypeWeaveAutoConfiguration.java   # imports generated packages (if needed)
 ```
@@ -326,6 +465,9 @@ typeweave:
     service-impl: ServiceImpl
   defaults:
     fetch-many: entity-graph
+    page-size: 20
+    max-page-size: 100
+  trail-param: trail          # query param name for graph expansion
   strict-controller: true   # fail if controller body doesn't match expected delegate call
 ```
 
@@ -354,17 +496,19 @@ typeweave:
 
 ### Phase 1 — Read path MVP
 
-- [ ] `typeweave-annotations` module
-- [ ] Processor: `@WeaveRead` + `@BindKey` + single `@Trail`
-- [ ] Generate repository + service + impl
-- [ ] Demo app: User GET by id with orders
-- [ ] Compile-time error catalog TW001–TW006
+- [ ] `typeweave-annotations` module (`@WeaveRead`, `@BindKey`, `@TrailShape`, `@DefaultResponse`)
+- [ ] Trail-driven DTO registry: `GET /users/{id}` vs `?trail=user.orders`
+- [ ] Processor: single + multiple `@TrailShape` per method; TW007/TW009
+- [ ] Generate repository + service + impl + per-shape mappers
+- [ ] Demo app: `UserResponseDto` vs `UserDetailResponseDto` on same endpoint
+- [ ] Compile-time error catalog TW001–TW007, TW009
 
-### Phase 2 — Writes and lists
+### Phase 2 — Lists, pagination, writes
 
-- [ ] `@WeaveWrite`, `@WeaveList` with pagination
-- [ ] MapStruct integration for DTO mapping
-- [ ] Multiple trails and fetch strategy config
+- [ ] `@WeaveList` with `Pageable`, `sortable`, default/max page size (TW008)
+- [ ] `@WeaveWrite` for mutations
+- [ ] MapStruct integration for all trail shapes
+- [ ] Fetch strategy config for `@OneToMany` / `@ManyToOne` on list endpoints
 
 ### Phase 3 — Ergonomics
 
@@ -385,9 +529,12 @@ typeweave:
 
 ## 15. Success Criteria
 
-- A developer adds `@WeaveRead` on one controller method and receives working repository + service without hand-writing queries for the declared bind key and trail.
-- Wrong field reference in `BindKey` or `Trail` fails compilation with TW002/TW003.
-- Application starts on Spring Boot 4 with Java 25 toolchain and passes integration test for the woven endpoint.
+- Hand-written `UserEntity`, `UserResponseDto`, `UserDetailResponseDto`, and `UserController`; generated repository, service, and mappers.
+- `GET /users/{id}` returns `UserResponseDto`; `GET /users/{id}?trail=user.orders` returns `UserDetailResponseDto` with orders loaded — wrong trail → 400.
+- A developer adds `@WeaveRead` + `@TrailShape` and receives working repository + service without hand-writing queries for each shape.
+- Wrong field reference in `BindKey` or `Trail`, or a DTO that references fields not on the trail graph, fails compilation (TW002, TW003, TW007).
+- Paginated `GET /users` with `@WeaveList` returns `Page<>` with configured defaults and validated sort fields.
+- Application starts on Spring Boot 4 with Java 25 toolchain and passes integration tests for default and trail-shaped reads.
 
 ---
 
@@ -395,11 +542,15 @@ typeweave:
 
 | thoughts.md | TypeWeave |
 |-------------|-----------|
-| `@ApiGetMetadata` | `@WeaveRead` |
+| Hand-written `UserEntity`, DTOs, `UserController` | Unchanged — author-owned types |
+| `@ApiGetMetadata` | `@WeaveRead` (+ `@TrailShape` when trail expands graph) |
 | `entity = UserEntity.class` | `entity = UserEntity.class` |
 | `lookupBy = UserEntity.id` | `bindKey = @BindKey(UserEntity_.id)` |
-| `alsoGet = {user.order}` | `trail = { @Trail(UserEntity_.orders) }` |
-| `UserDetailResponseDto` | `response = UserDetailResponseDto.class` |
+| `alsoGet = { user.order }` | `@TrailShape(trail = @Trail(UserEntity_.orders), …)` |
+| `UserDetailResponseDto` on expanded graph | `@TrailShape(…, response = UserDetailResponseDto.class)` |
+| `GET /users/{id}` without trail | `defaultResponse = UserResponseDto.class` |
+| Include pagination | `@WeaveList` + `Pageable` / `Page<>` |
+| Separate DTO per relation cardinality (`@OneToMany`, `@ManyToOne`) | One `@TrailShape` (and hand-written DTO) per trail; TW007 if DTO ⊄ graph |
 
 ---
 
